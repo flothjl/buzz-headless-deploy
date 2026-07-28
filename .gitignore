@@ -1,3 +1,5 @@
 config/*.env
 !config/*.env.example
+.codex/
+auth.json
 .DS_Store

@@ -17,7 +17,9 @@ done
 "${PROJECT_DIR}/buzz-sprig-deploy" help >/dev/null
 "${PROJECT_DIR}/scripts/remote-install.sh" --help >/dev/null
 
-for command in validate install check status start stop restart setup-systemd enable disable logs; do
+for command in \
+  validate install check status start stop restart setup-systemd enable disable logs \
+  codex-login codex-auth-status codex-logout; do
   grep -q "${command}" "${PROJECT_DIR}/buzz-sprig-deploy" ||
     {
       printf 'missing command surface: %s\n' "${command}" >&2
@@ -35,6 +37,21 @@ for directive in \
   grep -Fq "${directive}" "${PROJECT_DIR}/scripts/remote-install.sh" ||
     {
       printf 'missing systemd hardening directive: %s\n' "${directive}" >&2
+      exit 1
+    }
+done
+
+# These are intentionally literal source-code assertions.
+# shellcheck disable=SC2016
+for codex_requirement in \
+  '@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}' \
+  'CODEX_HOME=/var/lib/${SERVICE_USER}/.codex' \
+  'NO_BROWSER=1' \
+  'login status' \
+  'Node.js 20 or newer'; do
+  grep -Fq "${codex_requirement}" "${PROJECT_DIR}/scripts/remote-install.sh" ||
+    {
+      printf 'missing Codex runtime requirement: %s\n' "${codex_requirement}" >&2
       exit 1
     }
 done
@@ -75,6 +92,21 @@ BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DEPLOY_ENV}" \
 BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
   "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null
 
+CODEX_DEPLOY_ENV="${TEST_DIR}/codex.deploy.env"
+CODEX_AGENT_ENV="${TEST_DIR}/codex.agent.env"
+sed 's/^AGENT_RUNTIME=.*/AGENT_RUNTIME=codex/' \
+  "${TEST_DEPLOY_ENV}" >"${CODEX_DEPLOY_ENV}"
+sed \
+  -e 's#wss://buzz\.example\.com#wss://buzz.home.test#' \
+  -e "s/nsec1CHANGE_ME/$(printf '1%.0s' {1..64})/" \
+  -e "s/CHANGE_ME_OWNER_64_HEX/$(printf '2%.0s' {1..64})/" \
+  -e "s/CHANGE_ME_WIFE_64_HEX/$(printf '3%.0s' {1..64})/" \
+  "${PROJECT_DIR}/config/agent.env.example" >"${CODEX_AGENT_ENV}"
+chmod 600 "${CODEX_AGENT_ENV}"
+BUZZ_SPRIG_DEPLOY_CONFIG="${CODEX_DEPLOY_ENV}" \
+BUZZ_SPRIG_AGENT_ENV="${CODEX_AGENT_ENV}" \
+  "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null
+
 # GNU stat accepts -f but prints filesystem details, so validate must prefer
 # its -c mode syntax before trying the BSD/macOS -f fallback.
 # This function is exported and invoked indirectly by the child Bash process.
@@ -107,6 +139,24 @@ if BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DIR}/root.deploy.env" \
   BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
   "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null 2>&1; then
   printf 'validate accepted SERVICE_USER=root\n' >&2
+  exit 1
+fi
+
+sed 's/^AGENT_RUNTIME=.*/AGENT_RUNTIME=unknown/' \
+  "${TEST_DEPLOY_ENV}" >"${TEST_DIR}/bad-runtime.deploy.env"
+if BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DIR}/bad-runtime.deploy.env" \
+  BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
+  "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null 2>&1; then
+  printf 'validate accepted an unknown agent runtime\n' >&2
+  exit 1
+fi
+
+sed 's/^CODEX_ACP_VERSION=.*/CODEX_ACP_VERSION=latest/' \
+  "${CODEX_DEPLOY_ENV}" >"${TEST_DIR}/bad-codex-version.deploy.env"
+if BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DIR}/bad-codex-version.deploy.env" \
+  BUZZ_SPRIG_AGENT_ENV="${CODEX_AGENT_ENV}" \
+  "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null 2>&1; then
+  printf 'validate accepted a non-exact codex-acp version\n' >&2
   exit 1
 fi
 

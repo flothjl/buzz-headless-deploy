@@ -3,8 +3,10 @@
 Idempotent SSH deployment for a headless Buzz agent on a Linux machine.
 
 The project installs the published Sprig bundle, configures one agent instance,
-and manages it with systemd. The remote machine needs no inbound application
-port: `buzz-acp` connects outbound to the configured Buzz relay over WSS.
+and manages it with systemd. The runtime can be Sprig's bundled `buzz-agent` or
+Codex through `@agentclientprotocol/codex-acp`. The remote machine needs no
+inbound application port: `buzz-acp` connects outbound to the configured Buzz
+relay over WSS.
 
 This is an independent community deployment helper, not an official Block
 deployment or support channel. It downloads unmodified Sprig releases from the
@@ -14,8 +16,11 @@ official [`block/buzz`](https://github.com/block/buzz) project.
 
 - `/opt/buzz-sprig/releases/<version>-<checksum>-<target>/` — immutable Sprig releases
 - `/opt/buzz-sprig/current` — atomically updated symlink to the active release
+- `/opt/buzz-codex-acp/releases/<version>/` — optional immutable Codex adapter releases
+- `/opt/buzz-codex-acp/current` — optional active Codex adapter symlink
 - `/etc/buzz-agents/<agent>.env` — root-only agent configuration and secrets
 - `/srv/buzz-agents/<agent>/` — agent working directory
+- `/var/lib/buzz-<agent>/.codex/` — isolated Codex config and authentication
 - `/etc/systemd/system/buzz-agent@<agent>.service` — per-instance systemd unit
 - A dedicated, non-login service account (default: `buzz-<agent>`)
 
@@ -34,6 +39,8 @@ certificates, `curl`, `git`, `tar`, and checksum utilities).
 - The SHA-256 pin for the exact Sprig archive expected on the target architecture
 - The agent must be admitted to the Buzz relay and added to the channels it
   should observe
+- For `AGENT_RUNTIME=codex`, system-wide Node.js 20 or newer and npm on the
+  target. The adapter supplies its own compatible Codex CLI dependency.
 
 The deploy command intentionally uses non-interactive sudo so installs do not
 hang halfway through waiting for a password. The installer runs as root and can
@@ -51,7 +58,7 @@ $EDITOR config/deploy.env
 $EDITOR config/agent.env
 ```
 
-`config/deploy.env` describes the SSH target and installation behavior.
+`config/deploy.env` describes the SSH target, runtime, and installation behavior.
 `config/agent.env` is copied to the target and contains the agent identity,
 response policy, and LLM credentials.
 
@@ -62,15 +69,30 @@ Both real files are ignored by Git. The deployer refuses to use
 chmod 600 config/agent.env
 ```
 
-The default agent environment runs the bundled `buzz-agent` and
-`buzz-dev-mcp`. The remote installer owns these values and appends them after
-normalizing the supplied file:
+Choose the runtime in `config/deploy.env`:
+
+```dotenv
+# Provider API credentials configured in agent.env
+AGENT_RUNTIME=buzz-agent
+
+# Or ChatGPT/Codex authentication owned by the service user
+AGENT_RUNTIME=codex
+CODEX_ACP_VERSION=1.1.7
+```
+
+The remote installer owns the executable paths and appends them after
+normalizing the supplied file. The bundled runtime uses:
 
 ```dotenv
 BUZZ_ACP_AGENT_COMMAND=/opt/buzz-sprig/current/buzz-agent
 BUZZ_ACP_MCP_COMMAND=/opt/buzz-sprig/current/buzz-dev-mcp
 AGENT_CWD=/srv/buzz-agents/<agent>
 ```
+
+The Codex runtime instead uses the versioned adapter under
+`/opt/buzz-codex-acp`. Bundled `BUZZ_AGENT_*`, `OPENAI_COMPAT_*`,
+`ANTHROPIC_*`, and `DATABRICKS_*` variables are removed from its deployed
+environment because Codex authenticates independently.
 
 ## Install or update
 
@@ -91,11 +113,16 @@ The install is safe to repeat:
   pinned in local deployment configuration;
 - a release is stored under a checksum-specific immutable directory;
 - the `current` symlink is switched atomically;
+- an exact Codex adapter version is installed once and activated atomically
+  when `AGENT_RUNTIME=codex`;
 - each instance gets its own service account and exact systemd unit by default;
 - unchanged environment and unit files are not rewritten;
 - an active service is restarted only when its binary, environment, or unit
   changed;
 - systemd enablement is idempotent.
+
+For a first Codex deployment, `install` enables the unit but leaves it stopped
+until the dedicated service user is authenticated.
 
 ### Pinning and updating Sprig
 
@@ -121,6 +148,49 @@ before trusting a new value. To update rolling Sprig, update that pin and run
 `install` again. If versioned `sprig-v<VERSION>` releases are available, set
 `SPRIG_VERSION` to that version and pin its architecture-specific archive in
 the same way.
+
+### Codex subscription authentication
+
+Codex can use the ChatGPT subscription associated with a Codex CLI login; no
+OpenAI Platform API key is required. The deployment does not attach to an
+already-running Codex process. `codex-acp` starts a Codex App Server and reads
+the authentication cache under the service user's isolated `CODEX_HOME`.
+
+An existing login under your personal Linux account is intentionally not
+reused. The systemd service runs as `buzz-<agent>`, uses
+`/var/lib/buzz-<agent>/.codex`, and cannot read normal home directories.
+
+After the first Codex install:
+
+```bash
+./buzz-sprig-deploy install
+./buzz-sprig-deploy codex-login
+```
+
+`codex-login` runs `codex login --device-auth` as the dedicated service user.
+Open the displayed URL on another device and enter the one-time code. Device
+authentication must be enabled in your ChatGPT security settings or by your
+workspace administrator. After login succeeds, the command verifies the
+session and starts or restarts the service according to
+`ENABLE_ON_INSTALL`/`START_ON_INSTALL`.
+
+Check or remove the service account's authentication with:
+
+```bash
+./buzz-sprig-deploy codex-auth-status
+./buzz-sprig-deploy codex-logout
+```
+
+`codex-logout` stops the service before deleting its cached login. Treat
+`/var/lib/buzz-<agent>/.codex/auth.json` like a password: never copy it into
+`config/agent.env`, commit it, or expose it in support output. See the official
+[Codex authentication documentation](https://developers.openai.com/codex/auth)
+for device-code and headless-login details.
+
+To update the adapter, review the upstream
+[`codex-acp`](https://github.com/agentclientprotocol/codex-acp) release, set an
+exact `CODEX_ACP_VERSION`, and run `install` again. The npm package includes a
+compatible `@openai/codex` dependency.
 
 ## Operations
 
@@ -150,7 +220,8 @@ Disable boot-time startup and stop the service:
 Ctrl-C to exit.
 
 `validate` checks the local configuration and required agent settings without
-opening an SSH connection.
+opening an SSH connection. For Codex, `check` also verifies the managed adapter
+and the dedicated service user's login status.
 
 ## Multiple agents
 
@@ -182,6 +253,8 @@ identity; it does not create a second agent identity.
   service user. Treat messages and retrieved content as potentially hostile
   prompt input. Put only intended data under the agent working directory.
 - Never commit `config/agent.env`.
+- Never commit, copy into the project, or share a Codex `auth.json`. A ChatGPT
+  login cache contains refreshable account credentials.
 - Use separate LLM credentials with spending limits where possible.
 - Keep the household response allowlist narrow. Relay and channel membership do
   not replace `BUZZ_ACP_RESPOND_TO`.

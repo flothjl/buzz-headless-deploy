@@ -19,7 +19,12 @@ This project deliberately crosses several strong trust boundaries:
   systemd units.
 - The Sprig binaries come from the official `block/buzz` GitHub releases and
   must match a SHA-256 value pinned in local configuration.
+- The optional Codex adapter and its compatible Codex CLI are installed from
+  npm at the exact `CODEX_ACP_VERSION` selected by the operator.
 - `buzz-acp` holds an agent Nostr private key and model-provider credentials.
+- A Codex runtime stores refreshable ChatGPT credentials under the dedicated
+  service user's `/var/lib/<user>/.codex`; those credentials grant the agent
+  use of that account's Codex entitlement.
 - `buzz-dev-mcp` lets the model run shell and file operations as the dedicated
   service account.
 - The agent has outbound network access.
@@ -42,6 +47,7 @@ Never commit real configuration files such as:
 
 - `config/agent.env`
 - `config/deploy.env`
+- any `.codex/auth.json` or copied Codex authentication cache
 
 All `config/*.env` files are ignored by Git, but `git add --force` can override
 that protection.
@@ -53,6 +59,12 @@ repositories.
 If a secret is exposed, revoke or rotate it before removing it from Git history.
 Deleting a file in a later commit does not remove it from existing clones.
 
+Run Codex login only through the controller's `codex-login` command or another
+trusted service-user session. Do not place ChatGPT access or refresh tokens in
+an environment file. The secret scanner rejects a tracked `auth.json` and
+active `CODEX_API_KEY`, `OPENAI_API_KEY`, or `CODEX_ACCESS_TOKEN` assignments
+that do not contain obvious example placeholders.
+
 ## Release verification
 
 `SPRIG_SHA256` is the local trust pin. The installer requires both the published
@@ -63,6 +75,12 @@ review release provenance before accepting and storing a new pin.
 Archive paths and entry types are checked before extraction. Only regular files
 and directories are accepted; links, devices, absolute paths, and parent-path
 traversal are rejected.
+
+The Codex adapter is installed with npm lifecycle scripts disabled, verified to
+match the exact configured direct-package version, made read-only, and
+activated through an atomic symlink. npm still resolves the package's declared
+dependency graph, so review upstream adapter changes and npm provenance before
+updating `CODEX_ACP_VERSION`.
 
 ## Reporting a vulnerability
 

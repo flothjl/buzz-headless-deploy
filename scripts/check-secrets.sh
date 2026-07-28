@@ -22,7 +22,7 @@ scan_file() {
   fi
 
   matches="$(grep -nE \
-    '^[[:space:]]*(BUZZ_PRIVATE_KEY|OPENAI_COMPAT_API_KEY|ANTHROPIC_API_KEY|DATABRICKS_TOKEN)=' \
+    '^[[:space:]]*(BUZZ_PRIVATE_KEY|OPENAI_COMPAT_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|CODEX_ACCESS_TOKEN|ANTHROPIC_API_KEY|DATABRICKS_TOKEN)=' \
     "${file}" 2>/dev/null |
     grep -Ev '=($|CHANGE_ME($|[^A-Za-z0-9]))|=nsec1CHANGE_ME$' || true)"
   if [[ -n "${matches}" ]]; then
@@ -36,6 +36,7 @@ if command -v git >/dev/null 2>&1 &&
   while IFS= read -r file; do
     case "${file}" in
       config/*.env) report "${file} is tracked by Git" ;;
+      auth.json|*/auth.json) report "${file} contains a Codex authentication cache and is tracked by Git" ;;
     esac
     [[ -f "${file}" ]] && scan_file "${file}"
   done < <(git ls-files)

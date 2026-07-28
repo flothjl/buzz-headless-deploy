@@ -28,6 +28,10 @@ Commands:
   enable           Alias for setup-systemd
   disable          Stop the service and disable boot-time startup
   logs             Show recent logs and follow the journal
+  codex-login      Sign the dedicated service user into ChatGPT with a device code
+  codex-auth-status
+                   Show the dedicated service user's Codex authentication status
+  codex-logout     Stop the service and remove its cached Codex authentication
   help             Show this help
 
 Environment overrides:
@@ -115,6 +119,8 @@ load_config() {
   local default_service_user="buzz-${AGENT_NAME//./-}"
   SERVICE_USER="${SERVICE_USER:-${default_service_user}}"
   ALLOW_SHARED_SERVICE_USER="$(normalize_bool "${ALLOW_SHARED_SERVICE_USER:-false}")"
+  AGENT_RUNTIME="${AGENT_RUNTIME:-buzz-agent}"
+  CODEX_ACP_VERSION="${CODEX_ACP_VERSION:-1.1.7}"
   SPRIG_VERSION="${SPRIG_VERSION:-rolling}"
   : "${SPRIG_SHA256:?SPRIG_SHA256 is required in ${DEPLOY_CONFIG}}"
   ENABLE_ON_INSTALL="$(normalize_bool "${ENABLE_ON_INSTALL:-true}")"
@@ -131,6 +137,14 @@ load_config() {
   [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid SERVICE_USER"
   [[ "${#SERVICE_USER}" -le 32 ]] || die "SERVICE_USER must be at most 32 characters"
   [[ "${SERVICE_USER}" != "root" ]] || die "SERVICE_USER must not be root"
+  case "${AGENT_RUNTIME}" in
+    buzz-agent) ;;
+    codex)
+      [[ "${CODEX_ACP_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] ||
+        die "CODEX_ACP_VERSION must be an exact version such as 1.1.7"
+      ;;
+    *) die "AGENT_RUNTIME must be buzz-agent or codex" ;;
+  esac
   [[ "${SPRIG_VERSION}" == "rolling" || "${SPRIG_VERSION}" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] ||
     die "SPRIG_VERSION must be rolling or a version such as 0.3.0"
   [[ "${SPRIG_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
@@ -144,6 +158,10 @@ load_config() {
 
   SSH_TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
   SERVICE_NAME="buzz-agent@${AGENT_NAME}.service"
+  SERVICE_HOME="/var/lib/${SERVICE_USER}"
+  CODEX_HOME_PATH="${SERVICE_HOME}/.codex"
+  CODEX_ACP_PATH="/opt/buzz-codex-acp/current/node_modules/.bin/codex-acp"
+  CODEX_CLI_PATH="/opt/buzz-codex-acp/current/node_modules/.bin/codex"
 
   SSH_ARGS=(-p "${DEPLOY_PORT}" -o BatchMode=yes)
   SCP_ARGS=(-P "${DEPLOY_PORT}" -o BatchMode=yes)
@@ -164,7 +182,13 @@ validate_agent_env() {
     die "agent environment must set BUZZ_RELAY_URL"
   grep -Eq '^[[:space:]]*BUZZ_PRIVATE_KEY=' "${AGENT_ENV_FILE}" ||
     die "agent environment must set BUZZ_PRIVATE_KEY"
-  if grep -Ev '^[[:space:]]*#' "${AGENT_ENV_FILE}" |
+  if [[ "${AGENT_RUNTIME}" == "codex" ]]; then
+    if grep -Ev '^[[:space:]]*#' "${AGENT_ENV_FILE}" |
+      grep -Ev '^[[:space:]]*(BUZZ_AGENT_|OPENAI_COMPAT_|ANTHROPIC_|DATABRICKS_)' |
+      grep -Eq 'CHANGE_ME|buzz\.example\.com'; then
+      die "agent environment still contains example placeholders"
+    fi
+  elif grep -Ev '^[[:space:]]*#' "${AGENT_ENV_FILE}" |
     grep -Eq 'CHANGE_ME|buzz\.example\.com'; then
     die "agent environment still contains example placeholders"
   fi
@@ -191,6 +215,55 @@ ssh_root() {
   else
     ssh_exec "$@"
   fi
+}
+
+service_exec() {
+  ssh_root runuser --user "${SERVICE_USER}" -- \
+    env "HOME=${SERVICE_HOME}" "CODEX_HOME=${CODEX_HOME_PATH}" "$@"
+}
+
+require_codex_runtime() {
+  [[ "${AGENT_RUNTIME}" == "codex" ]] ||
+    die "this command requires AGENT_RUNTIME=codex"
+  ssh_root test -x "${CODEX_ACP_PATH}" ||
+    die "Codex runtime is not installed; run ./buzz-sprig-deploy install first"
+  ssh_root test -x "${CODEX_CLI_PATH}" ||
+    die "the managed Codex CLI is missing; run ./buzz-sprig-deploy install again"
+}
+
+codex_auth_status_remote() {
+  service_exec "${CODEX_CLI_PATH}" login status
+}
+
+require_runtime_auth() {
+  [[ "${AGENT_RUNTIME}" == "codex" ]] || return 0
+  require_codex_runtime
+  codex_auth_status_remote >/dev/null 2>&1 ||
+    die "Codex is not authenticated; run ./buzz-sprig-deploy codex-login"
+}
+
+codex_login_remote() {
+  require_codex_runtime
+  printf 'Starting Codex device authentication for service user %s...\n' "${SERVICE_USER}"
+  service_exec "${CODEX_CLI_PATH}" login --device-auth
+  codex_auth_status_remote
+
+  if [[ "${ENABLE_ON_INSTALL}" == "true" ]]; then
+    ssh_root systemctl enable "${SERVICE_NAME}" >/dev/null
+  fi
+  if [[ "${START_ON_INSTALL}" == "true" ]]; then
+    ssh_root systemctl restart "${SERVICE_NAME}"
+    ssh_root systemctl is-active "${SERVICE_NAME}"
+  else
+    printf 'authentication complete; START_ON_INSTALL=false, so %s was not started\n' "${SERVICE_NAME}"
+  fi
+}
+
+codex_logout_remote() {
+  require_codex_runtime
+  ssh_root systemctl stop "${SERVICE_NAME}"
+  service_exec "${CODEX_CLI_PATH}" logout
+  printf 'Codex authentication removed and %s stopped\n' "${SERVICE_NAME}"
 }
 
 REMOTE_TMP=""
@@ -224,6 +297,8 @@ install_remote() {
     --agent-name "${AGENT_NAME}" \
     --service-user "${SERVICE_USER}" \
     --allow-shared-service-user "${ALLOW_SHARED_SERVICE_USER}" \
+    --agent-runtime "${AGENT_RUNTIME}" \
+    --codex-acp-version "${CODEX_ACP_VERSION}" \
     --sprig-version "${SPRIG_VERSION}" \
     --sprig-sha256 "${SPRIG_SHA256}" \
     --agent-env-file "${REMOTE_TMP}/$(basename -- "${AGENT_ENV_FILE}")" \
@@ -237,13 +312,38 @@ install_remote() {
 
 check_remote() {
   local failed=0
-  printf 'Target:  %s\nAgent:   %s\nService: %s\n' "${SSH_TARGET}" "${AGENT_NAME}" "${SERVICE_NAME}"
+  printf 'Target:  %s\nAgent:   %s\nRuntime: %s\nService: %s\n' \
+    "${SSH_TARGET}" "${AGENT_NAME}" "${AGENT_RUNTIME}" "${SERVICE_NAME}"
 
   if ssh_root test -x /opt/buzz-sprig/current/sprig; then
     ssh_root /opt/buzz-sprig/current/sprig --version
   else
     printf 'missing: /opt/buzz-sprig/current/sprig\n' >&2
     failed=1
+  fi
+
+  if [[ "${AGENT_RUNTIME}" == "codex" ]]; then
+    local codex_runtime_ready=1
+    if ssh_root test -x "${CODEX_ACP_PATH}"; then
+      ssh_root "${CODEX_ACP_PATH}" --version || failed=1
+    else
+      printf 'missing: %s\n' "${CODEX_ACP_PATH}" >&2
+      failed=1
+      codex_runtime_ready=0
+    fi
+
+    if ! ssh_root test -x "${CODEX_CLI_PATH}"; then
+      printf 'missing: %s\n' "${CODEX_CLI_PATH}" >&2
+      failed=1
+      codex_runtime_ready=0
+    fi
+
+    if (( codex_runtime_ready )) && codex_auth_status_remote; then
+      printf 'codex authentication: ready\n'
+    else
+      printf 'codex authentication: missing or expired; run ./buzz-sprig-deploy codex-login\n' >&2
+      failed=1
+    fi
   fi
 
   if ssh_root systemctl is-enabled --quiet "${SERVICE_NAME}"; then
@@ -282,7 +382,11 @@ load_config
 case "${command}" in
   install)
     install_remote
-    if [[ "${ENABLE_ON_INSTALL}" == "true" && "${START_ON_INSTALL}" == "true" ]]; then
+    if [[ "${AGENT_RUNTIME}" == "codex" ]] &&
+      ! codex_auth_status_remote >/dev/null 2>&1; then
+      printf '\nCodex is installed but not authenticated for service user %s.\n' "${SERVICE_USER}"
+      printf 'Run: ./buzz-sprig-deploy codex-login\n'
+    elif [[ "${ENABLE_ON_INSTALL}" == "true" && "${START_ON_INSTALL}" == "true" ]]; then
       check_remote
     else
       printf 'Install completed without strict enabled/active checks because an install service flag is false.\n'
@@ -300,6 +404,7 @@ case "${command}" in
     ssh_root systemctl status "${SERVICE_NAME}" --no-pager --full
     ;;
   start)
+    require_runtime_auth
     ssh_root systemctl start "${SERVICE_NAME}"
     ssh_root systemctl is-active "${SERVICE_NAME}"
     ;;
@@ -308,10 +413,12 @@ case "${command}" in
     printf 'stopped %s\n' "${SERVICE_NAME}"
     ;;
   restart)
+    require_runtime_auth
     ssh_root systemctl restart "${SERVICE_NAME}"
     ssh_root systemctl is-active "${SERVICE_NAME}"
     ;;
   setup-systemd|enable)
+    require_runtime_auth
     ssh_root systemctl enable --now "${SERVICE_NAME}"
     ssh_root systemctl is-enabled "${SERVICE_NAME}"
     ssh_root systemctl is-active "${SERVICE_NAME}"
@@ -323,6 +430,16 @@ case "${command}" in
   logs)
     ssh_root journalctl --unit "${SERVICE_NAME}" --no-pager \
       --lines "${DEPLOY_LOG_LINES}" --follow
+    ;;
+  codex-login)
+    codex_login_remote
+    ;;
+  codex-auth-status)
+    require_codex_runtime
+    codex_auth_status_remote
+    ;;
+  codex-logout)
+    codex_logout_remote
     ;;
   *)
     usage >&2
