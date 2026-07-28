@@ -167,9 +167,9 @@ validate_agent_env() {
     die "agent environment still contains example placeholders"
   fi
   local permissions
-  permissions="$(stat -f '%Lp' "${AGENT_ENV_FILE}" 2>/dev/null ||
-    stat -c '%a' "${AGENT_ENV_FILE}" 2>/dev/null || true)"
-  [[ -n "${permissions}" ]] ||
+  permissions="$(stat -c '%a' "${AGENT_ENV_FILE}" 2>/dev/null ||
+    stat -f '%Lp' "${AGENT_ENV_FILE}" 2>/dev/null || true)"
+  [[ "${permissions}" =~ ^[0-7]{3,4}$ ]] ||
     die "could not determine permissions for ${AGENT_ENV_FILE}"
   [[ "${permissions}" == "600" ]] ||
     die "${AGENT_ENV_FILE} has mode ${permissions}; run: chmod 600 ${AGENT_ENV_FILE}"

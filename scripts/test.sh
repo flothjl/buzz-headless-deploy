@@ -73,6 +73,21 @@ BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DEPLOY_ENV}" \
 BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
   "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null
 
+# GNU stat accepts -f but prints filesystem details, so validate must prefer
+# its -c mode syntax before trying the BSD/macOS -f fallback.
+stat() {
+  case "${1:-}" in
+    -c) printf '600\n' ;;
+    -f) printf 'File: simulated GNU filesystem details\n' ;;
+    *) return 2 ;;
+  esac
+}
+export -f stat
+BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DEPLOY_ENV}" \
+BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
+  "${PROJECT_DIR}/buzz-sprig-deploy" validate >/dev/null
+unset -f stat
+
 chmod 644 "${TEST_AGENT_ENV}"
 if BUZZ_SPRIG_DEPLOY_CONFIG="${TEST_DEPLOY_ENV}" \
   BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
