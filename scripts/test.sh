@@ -39,6 +39,8 @@ for directive in \
     }
 done
 
+# This is intentionally the literal interpolation in the generated unit path.
+# shellcheck disable=SC2016
 grep -Fq 'buzz-agent@${AGENT_NAME}.service' \
   "${PROJECT_DIR}/scripts/remote-install.sh" ||
   {
@@ -75,6 +77,8 @@ BUZZ_SPRIG_AGENT_ENV="${TEST_AGENT_ENV}" \
 
 # GNU stat accepts -f but prints filesystem details, so validate must prefer
 # its -c mode syntax before trying the BSD/macOS -f fallback.
+# This function is exported and invoked indirectly by the child Bash process.
+# shellcheck disable=SC2317,SC2329
 stat() {
   case "${1:-}" in
     -c) printf '600\n' ;;

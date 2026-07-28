@@ -61,7 +61,7 @@ init_config() {
 
 expand_local_path() {
   local value="$1"
-  if [[ "${value}" == "~/"* ]]; then
+  if [[ "${value}" == \~/* ]]; then
     value="${HOME}/${value:2}"
   fi
   printf '%s\n' "${value}"
@@ -123,8 +123,10 @@ load_config() {
 
   [[ "${DEPLOY_HOST}" != *[[:space:]]* ]] || die "DEPLOY_HOST must not contain whitespace"
   [[ "${DEPLOY_USER}" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "invalid DEPLOY_USER"
-  [[ "${DEPLOY_PORT}" =~ ^[0-9]+$ ]] && (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 )) ||
+  if [[ ! "${DEPLOY_PORT}" =~ ^[0-9]+$ ]] ||
+    (( DEPLOY_PORT < 1 || DEPLOY_PORT > 65535 )); then
     die "DEPLOY_PORT must be between 1 and 65535"
+  fi
   [[ "${AGENT_NAME}" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || die "invalid AGENT_NAME"
   [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid SERVICE_USER"
   [[ "${#SERVICE_USER}" -le 32 ]] || die "SERVICE_USER must be at most 32 characters"
@@ -178,6 +180,8 @@ validate_agent_env() {
 ssh_exec() {
   local command
   command="$(shell_join "$@")"
+  # shell_join has already quoted every argument for evaluation by the remote shell.
+  # shellcheck disable=SC2029
   ssh "${SSH_ARGS[@]}" "${SSH_TARGET}" "${command}"
 }
 
