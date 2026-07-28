@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_CONFIG="${BUZZ_SPRIG_DEPLOY_CONFIG:-${PROJECT_DIR}/config/deploy.env}"
+AGENT_ENV_FILE="${BUZZ_SPRIG_AGENT_ENV:-${PROJECT_DIR}/config/agent.env}"
+REMOTE_INSTALLER="${PROJECT_DIR}/scripts/remote-install.sh"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: ./buzz-sprig-deploy <command>
+
+Commands:
+  init             Create config/*.env from examples without overwriting
+  validate         Validate local configuration without connecting
+  install          Install/update Sprig, environment, and systemd service
+  check            Verify binary, systemd enablement, and active state
+  status           Show full systemd status
+  start            Start the agent service
+  stop             Stop the agent service
+  restart          Restart the agent service
+  setup-systemd    Enable the service at boot and start it now
+  enable           Alias for setup-systemd
+  disable          Stop the service and disable boot-time startup
+  logs             Show recent logs and follow the journal
+  help             Show this help
+
+Environment overrides:
+  BUZZ_SPRIG_DEPLOY_CONFIG  Path to deploy.env
+  BUZZ_SPRIG_AGENT_ENV      Path to agent.env
+USAGE
+}
+
+init_config() {
+  local created=0
+  mkdir -p -- "${PROJECT_DIR}/config"
+  if [[ ! -e "${PROJECT_DIR}/config/deploy.env" ]]; then
+    cp -- "${PROJECT_DIR}/config/deploy.env.example" "${PROJECT_DIR}/config/deploy.env"
+    printf 'created %s\n' "${PROJECT_DIR}/config/deploy.env"
+    created=1
+  else
+    printf 'kept existing %s\n' "${PROJECT_DIR}/config/deploy.env"
+  fi
+  if [[ ! -e "${PROJECT_DIR}/config/agent.env" ]]; then
+    cp -- "${PROJECT_DIR}/config/agent.env.example" "${PROJECT_DIR}/config/agent.env"
+    chmod 600 "${PROJECT_DIR}/config/agent.env"
+    printf 'created %s\n' "${PROJECT_DIR}/config/agent.env"
+    created=1
+  else
+    printf 'kept existing %s\n' "${PROJECT_DIR}/config/agent.env"
+  fi
+  if (( created )); then
+    printf 'Edit both files before running install.\n'
+  fi
+}
+
+expand_local_path() {
+  local value="$1"
+  if [[ "${value}" == "~/"* ]]; then
+    value="${HOME}/${value:2}"
+  fi
+  printf '%s\n' "${value}"
+}
+
+absolute_existing_file() {
+  local value="$1"
+  if [[ "${value}" != /* ]]; then
+    value="${PROJECT_DIR}/${value}"
+  fi
+  [[ -f "${value}" ]] || die "file not found: ${value}"
+  local directory
+  directory="$(cd -- "$(dirname -- "${value}")" && pwd)"
+  printf '%s/%s\n' "${directory}" "$(basename -- "${value}")"
+}
+
+normalize_bool() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes|on) printf 'true\n' ;;
+    false|0|no|off) printf 'false\n' ;;
+    *) die "expected true or false, got: $1" ;;
+  esac
+}
+
+shell_join() {
+  local output="" quoted arg
+  for arg in "$@"; do
+    printf -v quoted '%q' "${arg}"
+    output+="${output:+ }${quoted}"
+  done
+  printf '%s\n' "${output}"
+}
+
+load_config() {
+  DEPLOY_CONFIG="$(absolute_existing_file "${DEPLOY_CONFIG}")"
+
+  # Configuration is operator-owned shell syntax. Export values while sourcing
+  # so callers may use normal KEY=value files without `export`.
+  set -a
+  # shellcheck disable=SC1090
+  source "${DEPLOY_CONFIG}"
+  set +a
+
+  : "${DEPLOY_HOST:?DEPLOY_HOST is required in ${DEPLOY_CONFIG}}"
+  : "${DEPLOY_USER:?DEPLOY_USER is required in ${DEPLOY_CONFIG}}"
+  : "${AGENT_NAME:?AGENT_NAME is required in ${DEPLOY_CONFIG}}"
+
+  DEPLOY_PORT="${DEPLOY_PORT:-22}"
+  DEPLOY_IDENTITY_FILE="${DEPLOY_IDENTITY_FILE:-}"
+  DEPLOY_USE_SUDO="$(normalize_bool "${DEPLOY_USE_SUDO:-true}")"
+  local default_service_user="buzz-${AGENT_NAME//./-}"
+  SERVICE_USER="${SERVICE_USER:-${default_service_user}}"
+  ALLOW_SHARED_SERVICE_USER="$(normalize_bool "${ALLOW_SHARED_SERVICE_USER:-false}")"
+  SPRIG_VERSION="${SPRIG_VERSION:-rolling}"
+  : "${SPRIG_SHA256:?SPRIG_SHA256 is required in ${DEPLOY_CONFIG}}"
+  ENABLE_ON_INSTALL="$(normalize_bool "${ENABLE_ON_INSTALL:-true}")"
+  START_ON_INSTALL="$(normalize_bool "${START_ON_INSTALL:-true}")"
+  DEPLOY_LOG_LINES="${DEPLOY_LOG_LINES:-100}"
+
+  [[ "${DEPLOY_HOST}" != *[[:space:]]* ]] || die "DEPLOY_HOST must not contain whitespace"
+  [[ "${DEPLOY_USER}" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "invalid DEPLOY_USER"
+  [[ "${DEPLOY_PORT}" =~ ^[0-9]+$ ]] && (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 )) ||
+    die "DEPLOY_PORT must be between 1 and 65535"
+  [[ "${AGENT_NAME}" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || die "invalid AGENT_NAME"
+  [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid SERVICE_USER"
+  [[ "${#SERVICE_USER}" -le 32 ]] || die "SERVICE_USER must be at most 32 characters"
+  [[ "${SERVICE_USER}" != "root" ]] || die "SERVICE_USER must not be root"
+  [[ "${SPRIG_VERSION}" == "rolling" || "${SPRIG_VERSION}" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] ||
+    die "SPRIG_VERSION must be rolling or a version such as 0.3.0"
+  [[ "${SPRIG_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "SPRIG_SHA256 must be the pinned 64-character archive checksum"
+  [[ "${DEPLOY_LOG_LINES}" =~ ^[0-9]+$ ]] || die "DEPLOY_LOG_LINES must be an integer"
+
+  if [[ -n "${DEPLOY_IDENTITY_FILE}" ]]; then
+    DEPLOY_IDENTITY_FILE="$(expand_local_path "${DEPLOY_IDENTITY_FILE}")"
+    [[ -f "${DEPLOY_IDENTITY_FILE}" ]] || die "SSH identity not found: ${DEPLOY_IDENTITY_FILE}"
+  fi
+
+  SSH_TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+  SERVICE_NAME="buzz-agent@${AGENT_NAME}.service"
+
+  SSH_ARGS=(-p "${DEPLOY_PORT}" -o BatchMode=yes)
+  SCP_ARGS=(-P "${DEPLOY_PORT}" -o BatchMode=yes)
+  if [[ -n "${DEPLOY_IDENTITY_FILE}" ]]; then
+    SSH_ARGS+=(-i "${DEPLOY_IDENTITY_FILE}")
+    SCP_ARGS+=(-i "${DEPLOY_IDENTITY_FILE}")
+  fi
+}
+
+resolve_install_files() {
+  AGENT_ENV_FILE="$(absolute_existing_file "${AGENT_ENV_FILE}")"
+  REMOTE_INSTALLER="$(absolute_existing_file "${REMOTE_INSTALLER}")"
+}
+
+validate_agent_env() {
+  [[ -r "${AGENT_ENV_FILE}" ]] || die "agent environment is not readable: ${AGENT_ENV_FILE}"
+  grep -Eq '^[[:space:]]*BUZZ_RELAY_URL=' "${AGENT_ENV_FILE}" ||
+    die "agent environment must set BUZZ_RELAY_URL"
+  grep -Eq '^[[:space:]]*BUZZ_PRIVATE_KEY=' "${AGENT_ENV_FILE}" ||
+    die "agent environment must set BUZZ_PRIVATE_KEY"
+  if grep -Ev '^[[:space:]]*#' "${AGENT_ENV_FILE}" |
+    grep -Eq 'CHANGE_ME|buzz\.example\.com'; then
+    die "agent environment still contains example placeholders"
+  fi
+  local permissions
+  permissions="$(stat -f '%Lp' "${AGENT_ENV_FILE}" 2>/dev/null ||
+    stat -c '%a' "${AGENT_ENV_FILE}" 2>/dev/null || true)"
+  [[ -n "${permissions}" ]] ||
+    die "could not determine permissions for ${AGENT_ENV_FILE}"
+  [[ "${permissions}" == "600" ]] ||
+    die "${AGENT_ENV_FILE} has mode ${permissions}; run: chmod 600 ${AGENT_ENV_FILE}"
+}
+
+ssh_exec() {
+  local command
+  command="$(shell_join "$@")"
+  ssh "${SSH_ARGS[@]}" "${SSH_TARGET}" "${command}"
+}
+
+ssh_root() {
+  if [[ "${DEPLOY_USE_SUDO}" == "true" ]]; then
+    ssh_exec sudo -n -- "$@"
+  else
+    ssh_exec "$@"
+  fi
+}
+
+REMOTE_TMP=""
+cleanup_remote_tmp() {
+  if [[ "${REMOTE_TMP}" =~ ^/tmp/buzz-sprig-deploy\.[A-Za-z0-9]+$ ]]; then
+    ssh_exec rm -rf -- "${REMOTE_TMP}" >/dev/null 2>&1 || true
+  fi
+}
+
+install_remote() {
+  resolve_install_files
+  validate_agent_env
+
+  printf 'Connecting to %s...\n' "${SSH_TARGET}"
+  ssh_exec true
+
+  REMOTE_TMP="$(ssh_exec mktemp -d /tmp/buzz-sprig-deploy.XXXXXX)"
+  REMOTE_TMP="${REMOTE_TMP//$'\r'/}"
+  [[ "${REMOTE_TMP}" =~ ^/tmp/buzz-sprig-deploy\.[A-Za-z0-9]+$ ]] ||
+    die "remote mktemp returned an unexpected path"
+  trap cleanup_remote_tmp EXIT
+
+  scp "${SCP_ARGS[@]}" \
+    "${REMOTE_INSTALLER}" \
+    "${AGENT_ENV_FILE}" \
+    "${SSH_TARGET}:${REMOTE_TMP}/"
+  ssh_exec chmod 700 "${REMOTE_TMP}/remote-install.sh"
+  ssh_exec chmod 600 "${REMOTE_TMP}/$(basename -- "${AGENT_ENV_FILE}")"
+
+  ssh_root /bin/bash "${REMOTE_TMP}/remote-install.sh" \
+    --agent-name "${AGENT_NAME}" \
+    --service-user "${SERVICE_USER}" \
+    --allow-shared-service-user "${ALLOW_SHARED_SERVICE_USER}" \
+    --sprig-version "${SPRIG_VERSION}" \
+    --sprig-sha256 "${SPRIG_SHA256}" \
+    --agent-env-file "${REMOTE_TMP}/$(basename -- "${AGENT_ENV_FILE}")" \
+    --enable-service "${ENABLE_ON_INSTALL}" \
+    --start-service "${START_ON_INSTALL}"
+
+  cleanup_remote_tmp
+  REMOTE_TMP=""
+  trap - EXIT
+}
+
+check_remote() {
+  local failed=0
+  printf 'Target:  %s\nAgent:   %s\nService: %s\n' "${SSH_TARGET}" "${AGENT_NAME}" "${SERVICE_NAME}"
+
+  if ssh_root test -x /opt/buzz-sprig/current/sprig; then
+    ssh_root /opt/buzz-sprig/current/sprig --version
+  else
+    printf 'missing: /opt/buzz-sprig/current/sprig\n' >&2
+    failed=1
+  fi
+
+  if ssh_root systemctl is-enabled --quiet "${SERVICE_NAME}"; then
+    printf 'enabled: yes\n'
+  else
+    printf 'enabled: no\n' >&2
+    failed=1
+  fi
+
+  if ssh_root systemctl is-active --quiet "${SERVICE_NAME}"; then
+    printf 'active:  yes\n'
+  else
+    printf 'active:  no\n' >&2
+    failed=1
+  fi
+
+  ssh_root systemctl show "${SERVICE_NAME}" --no-pager \
+    --property=ActiveState,SubState,MainPID,ExecMainStatus,NRestarts || failed=1
+  return "${failed}"
+}
+
+command="${1:-help}"
+case "${command}" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  init)
+    init_config
+    exit 0
+    ;;
+esac
+
+load_config
+
+case "${command}" in
+  install)
+    install_remote
+    if [[ "${ENABLE_ON_INSTALL}" == "true" && "${START_ON_INSTALL}" == "true" ]]; then
+      check_remote
+    else
+      printf 'Install completed without strict enabled/active checks because an install service flag is false.\n'
+    fi
+    ;;
+  validate)
+    resolve_install_files
+    validate_agent_env
+    printf 'configuration is valid for agent %s on %s\n' "${AGENT_NAME}" "${SSH_TARGET}"
+    ;;
+  check)
+    check_remote
+    ;;
+  status)
+    ssh_root systemctl status "${SERVICE_NAME}" --no-pager --full
+    ;;
+  start)
+    ssh_root systemctl start "${SERVICE_NAME}"
+    ssh_root systemctl is-active "${SERVICE_NAME}"
+    ;;
+  stop)
+    ssh_root systemctl stop "${SERVICE_NAME}"
+    printf 'stopped %s\n' "${SERVICE_NAME}"
+    ;;
+  restart)
+    ssh_root systemctl restart "${SERVICE_NAME}"
+    ssh_root systemctl is-active "${SERVICE_NAME}"
+    ;;
+  setup-systemd|enable)
+    ssh_root systemctl enable --now "${SERVICE_NAME}"
+    ssh_root systemctl is-enabled "${SERVICE_NAME}"
+    ssh_root systemctl is-active "${SERVICE_NAME}"
+    ;;
+  disable)
+    ssh_root systemctl disable --now "${SERVICE_NAME}"
+    printf 'disabled and stopped %s\n' "${SERVICE_NAME}"
+    ;;
+  logs)
+    ssh_root journalctl --unit "${SERVICE_NAME}" --no-pager \
+      --lines "${DEPLOY_LOG_LINES}" --follow
+    ;;
+  *)
+    usage >&2
+    die "unknown command: ${command}"
+    ;;
+esac
